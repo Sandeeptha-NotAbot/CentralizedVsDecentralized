@@ -6,9 +6,6 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 public class Simulation {
-
-    // --- Core Utility Functions ---
-
     /**
      * Calculates the Inventory Position (IP) for a node.
      * IP = Stock on Hand + Stock on Order - Backorder Liability
@@ -87,11 +84,9 @@ public class Simulation {
     /**
      * This is the "cost accounting" step at the end of the day. 
      */
-    private void accrueDailyCosts(List<NodeState> allNodes, Metrics metrics) {
+    private void accrueDailyCosts(List<NodeState> allNodes, Metrics metrics, double customHolding) {
         for (NodeState n : allNodes) {
-            // Holding cost is applied to *ending* inventory.
-            metrics.addHoldingCost(n.getOnHand() * Params.COST_HOLDING_PER_DAY); 
-            // Backorder cost is applied to the liability carried into the next day.
+            metrics.addHoldingCost(n.getOnHand() * customHolding);
             metrics.addBackorderCost(n.getBackorder() * Params.COST_BACKORDER_PER_DAY);
         }
     }
@@ -101,260 +96,163 @@ public class Simulation {
      * NOTE: This simplified version ignores correlation (rho). 
      * A full implementation requires a multivariate normal draw function.
      */
-    private int drawDailyDemand(int retailerIndex) {
-        // Retailer index is not used in the simplified independent case.
-        // Option A: independent Normal truncated at 0 
+    private int drawDailyDemand(double sigma) {
+        // Uses the mu from Params and the sigma passed from the test scenario  
         double mu = Params.DEMAND_MEAN_DAILY;
-        double sigma = Params.DEMAND_SIGMA_DAILY;
         
-        // Simple approximation of Normal distribution draw
+        // Simple approximation of Normal distribution draw  
         double demandDraw = ThreadLocalRandom.current().nextGaussian() * sigma + mu;
         
-        // Demand is always non-negative and an integer.
+        // Demand must be non-negative and an integer  
         return Math.max(0, (int) Math.round(demandDraw)); 
     }
 
-    /**
-     * Calculates the target S for each node based on Normal distribution approximation (safety stock formula). 
-     */
-    public void computeBaseStocks(List<NodeState> retailers, NodeState cw, boolean centralized) {
-        double mu = Params.DEMAND_MEAN_DAILY; // Average demand per day. 
-        double sigma = Params.DEMAND_SIGMA_DAILY; // Demand standard deviation per day.
-        double z = Params.getZScoreForServiceTarget(); // z-score chosen to achieve the target service level. 
+    public void computeBaseStocksAdvanced(List<NodeState> retailers, NodeState cw, boolean centralized, double rho, int leadTime, double sigma) {
+        double mu = Params.DEMAND_MEAN_DAILY;
+        double z = Params.getZScoreForServiceTarget();
 
-        // --- Retailers ---
         for (NodeState r : retailers) {
-            // L is the Lead Time (L) relevant to the node's supplier. 
-            int L = centralized ? Params.LT_CW_TO_RETAILER : Params.LT_MFG_TO_RETAILER;
-
-            // S_i = Expected Demand Over Lead Time + Safety Stock 
-            double sI = mu * L + z * sigma * Math.sqrt(L); // The safety stock term is crucial.
+            int L = centralized ? Params.LT_CW_TO_RETAILER : leadTime;
+            double sI = mu * L + z * sigma * Math.sqrt(L);
             r.setBaseStock((int) Math.round(sI));
         }
 
-        // --- Central Warehouse (CW) ---
         if (centralized && cw != null) {
             int N = Params.N_RETAILERS;
-            double rho = Params.DEMAND_CORRELATION_RHO;
-
-            // Aggregated variability: core logic of Risk Pooling. 
-            // sigma_agg = sigma * sqrt(N + ρ N(N-1)) for identical retailers 
-            double sigmaAggSquared = N * sigma * sigma + rho * N * (N - 1) * sigma * sigma;
-            double sigmaAgg = Math.sqrt(sigmaAggSquared);// Aggregated standard deviation calculation. 
-            
-            int lCw = Params.LT_MFG_TO_CW; // CW's relevant lead time (from MFG). 
-            double muAgg = N * mu; // Aggregated mean demand (sum of all retailers).
-
-            // SCW = Expected Demand Over Lead Time + Safety Stock (using lower aggregated variability)
-            double sCW = muAgg * lCw + z * sigmaAgg * Math.sqrt(lCw); 
-            cw.setBaseStock((int) Math.round(sCW)); 
+            // Analytical Risk Pooling Formula 
+            double sigmaAgg = sigma * Math.sqrt(N + rho * N * (N - 1));
+            int lCw = Params.LT_MFG_TO_CW;
+            double muAgg = N * mu;
+            double sCW = muAgg * lCw + z * sigmaAgg * Math.sqrt(lCw);
+            cw.setBaseStock((int) Math.round(sCW));
         }
     }
 
-    /**
-     * Simulates the system (MFG -> CW -> Retailers). 
-     */
-    public Metrics runCentralizedReplication(int seed, List<NodeState> retailers, NodeState cw, NodeState mfg) {
-        // init RNG(seed) (Done implicitly by ThreadLocalRandom or explicitly with a seed)
-        Metrics metrics = new Metrics(); // METRICS <- zeros 
-        
-        // Assume initial states are set (on_hand to base_stock, backorder=0, in_transit=[]) 
+    // --- Replications ---
+
+    public Metrics runCentralizedReplication(int seed, List<NodeState> retailers, NodeState cw, NodeState mfg, double sigma, double holding) {
+        Metrics metrics = new Metrics();
         List<NodeState> allNodes = new ArrayList<>();
         allNodes.add(cw);
         allNodes.addAll(retailers);
 
         for (int day = 1; day <= Params.T_DAYS; day++) {
-
-            // 1) Arrivals then clear backorders
             receiveShipments(cw, day);
             clearBackordersWithReceipt(cw);
             for (NodeState r : retailers) {
                 receiveShipments(r, day);
                 clearBackordersWithReceipt(r);
             }
-
-            // 2) Retailer demand realization and service (customer-facing)
-            for (int i = 0; i < retailers.size(); i++) { // for each retailer r:
-                NodeState r = retailers.get(i);
-                int d = drawDailyDemand(i);
-                fulfillDemand(r, d, metrics);
+            for (int i = 0; i < retailers.size(); i++) {
+                fulfillDemand(retailers.get(i), drawDailyDemand(sigma), metrics);
             }
-
-            // 4) End-of-day base-stock review at CW (order to MFG if needed)
-            placeBaseStockOrder(cw, mfg, Params.LT_MFG_TO_CW,
-                                Params.COST_TRANSPORT_INBOUND, day, metrics); // CW orders to top up its own IP.
-
-            // 5) End-of-day retailer reviews & orders to CW
-            for (NodeState r : retailers) { 
-                // Retailers order from the CW.
-                placeBaseStockOrder(r, cw, Params.LT_CW_TO_RETAILER,
-                                   Params.COST_TRANSPORT_OUTBOUND, day, metrics);
+            placeBaseStockOrder(cw, mfg, Params.LT_MFG_TO_CW, Params.COST_TRANSPORT_INBOUND, day, metrics);
+            for (NodeState r : retailers) {
+                placeBaseStockOrder(r, cw, Params.LT_CW_TO_RETAILER, Params.COST_TRANSPORT_OUTBOUND, day, metrics);
             }
-            // The CW is assumed to immediately ship from stock (logic handled inside placeBaseStockOrder). 
-
-            // 6) Costs for the day
-            accrueDailyCosts(allNodes, metrics); // Costs apply to all nodes in the system. 
+            accrueDailyCosts(allNodes, metrics, holding);
         }
-        return metrics; 
+        return metrics;
     }
 
-    /**
-     * Simulates the single system (MFG -> Retailers). 
-     */
-    public Metrics runDecentralizedReplication(int seed, List<NodeState> retailers, NodeState mfg) {
-        // init RNG(seed)
-        Metrics metrics = new Metrics(); // METRICS <- zeros 
-        
-        // Assume initial states are set (on_hand=base_stock, backorder=0, in_transit=[])
-
+    public Metrics runDecentralizedReplication(int seed, List<NodeState> retailers, NodeState mfg, double sigma, double holding) {
+        Metrics metrics = new Metrics();
         for (int day = 1; day <= Params.T_DAYS; day++) {
-
-            // 1) Arrivals then clear backorders
             for (NodeState r : retailers) {
                 receiveShipments(r, day);
                 clearBackordersWithReceipt(r);
             }
-
-            // 2) Retailer demand realization
             for (int i = 0; i < retailers.size(); i++) {
-                NodeState r = retailers.get(i);
-                int d = drawDailyDemand(i);
-                fulfillDemand(r, d, metrics);
+                fulfillDemand(retailers.get(i), drawDailyDemand(sigma), metrics);
             }
-
-            // 3) End-of-day retailer reviews & orders directly to MFG
             for (NodeState r : retailers) {
-                // Retailers order directly from the MFG.
-                placeBaseStockOrder(r, mfg, Params.LT_MFG_TO_RETAILER, 
-                                    Params.COST_TRANSPORT_DIRECT, day, metrics);
+                placeBaseStockOrder(r, mfg, Params.LT_MFG_TO_RETAILER, Params.COST_TRANSPORT_DIRECT, day, metrics);
             }
-
-            // 4) Costs for the day
-            accrueDailyCosts(retailers, metrics); // Costs only apply to the retailer nodes. 
+            accrueDailyCosts(retailers, metrics, holding);
         }
-        return metrics; 
+        return metrics;
     }
 
     /**
      * The overarching function that runs both scenarios and compares results.
      */
     public void runExperiment() {
-        System.out.println("--- Starting Inventory Centralization vs. Decentralization Experiment ---");
+        System.out.println("--- Phase 7: Validation and Stress Testing ---");
 
-        List<Metrics> resultsCentralized = new ArrayList<>();
-        List<Metrics> resultsDecentralized = new ArrayList<>();
+        System.out.println("\nTEST 1: Independent Demand (Rho = 0.0)");
+        executeScenario(0.0, Params.LT_MFG_TO_RETAILER, Params.DEMAND_SIGMA_DAILY, Params.COST_HOLDING_PER_DAY);
 
-        // Initialize nodes outside the loop to be reused and re-initialized per replication
-        NodeState mfg = new NodeState("MFG", 0); // Manufacturer has infinite capacity (onHand unused)
-        NodeState cw = new NodeState("CW", 0); // Central Warehouse
+        System.out.println("\nTEST 2: Correlated Demand (Rho = 1.0)");
+        executeScenario(1.0, Params.LT_MFG_TO_RETAILER, Params.DEMAND_SIGMA_DAILY, Params.COST_HOLDING_PER_DAY);
+
+        System.out.println("\nTEST 3: Normalized Lead Times (Path LT = 4 days)");
+        executeScenario(0.0, 4, Params.DEMAND_SIGMA_DAILY, Params.COST_HOLDING_PER_DAY);
+
+        System.out.println("\nTEST 4: High Demand Variability (Sigma = 60)");
+        executeScenario(0.0, Params.LT_MFG_TO_RETAILER, 60.0, Params.COST_HOLDING_PER_DAY);
+
+        System.out.println("\nTEST 5: High Holding Cost ($1.00)");
+        executeScenario(0.0, Params.LT_MFG_TO_RETAILER, Params.DEMAND_SIGMA_DAILY, 1.00);
+    }
+
+    // Overloaded helper for 2-argument calls
+    private void executeScenario(double rho, int decentralizedLT) {
+        executeScenario(rho, decentralizedLT, Params.DEMAND_SIGMA_DAILY, Params.COST_HOLDING_PER_DAY);
+    }
+
+    private void executeScenario(double rho, int decentralizedLT, double sigma, double holding) {
+        List<Metrics> resultsC = new ArrayList<>();
+        List<Metrics> resultsD = new ArrayList<>();
+        NodeState mfg = new NodeState("MFG");
+        NodeState cw = new NodeState("CW");
         List<NodeState> retailers = new ArrayList<>();
-        for (int i = 0; i < Params.N_RETAILERS; i++) {
-            retailers.add(new NodeState("Retailer_" + (i + 1), 0));
-        }
+        for (int i = 1; i <= Params.N_RETAILERS; i++) retailers.add(new NodeState("R" + i));
 
         for (int rep = 1; rep <= Params.R_REPLICATIONS; rep++) {
-            // --- CENTRALIZED RUN ---
-            computeBaseStocks(retailers, cw, true); // Calculate S values for Centralized design
-            // Reset and warm-up inventory states (simplification: setting initial stock to Base Stock S)
-            cw.setOnHand(cw.getBaseStock()); cw.setBackorder(0); cw.getInTransit().clear();
-            for (NodeState r : retailers) {
-                r.setOnHand(r.getBaseStock()); r.setBackorder(0); r.getInTransit().clear();
-            }
-            Metrics resC = runCentralizedReplication(rep, retailers, cw, mfg);
-            resultsCentralized.add(resC);
-            
+            computeBaseStocksAdvanced(retailers, cw, true, rho, decentralizedLT, sigma);
+            resetNodes(cw, retailers);
+            resultsC.add(runCentralizedReplication(rep, retailers, cw, mfg, sigma, holding));
 
-            // --- DECENTRALIZED RUN ---
-            // Recalculate S values for Decentralized design (uses LT_MFG_TO_RETAILER)
-            computeBaseStocks(retailers, null, false); 
-            // Reset and warm-up inventory states
-            for (NodeState r : retailers) {
-                r.setOnHand(r.getBaseStock()); r.setBackorder(0); r.getInTransit().clear();
-            }
-            Metrics resD = runDecentralizedReplication(rep, retailers, mfg);
-            resultsDecentralized.add(resD);
+            computeBaseStocksAdvanced(retailers, null, false, rho, decentralizedLT, sigma);
+            resetNodes(null, retailers);
+            resultsD.add(runDecentralizedReplication(rep, retailers, mfg, sigma, holding));
         }
-
-        // 3. Summarize and Print Results
-        System.out.println("\n--- Summary Results Averaged Over " + Params.R_REPLICATIONS + " Replications ---");
-        
-        // This function will summarize results (Phase 5 task)
-        summarizeResults(resultsCentralized, resultsDecentralized);
+        summarizeResults(resultsC, resultsD);
     }
 
-    // Add a simple Main method to run the experiment
+    private void resetNodes(NodeState cw, List<NodeState> retailers) {
+        if (cw != null) {
+            cw.setOnHand(cw.getBaseStock()); cw.getInTransit().clear(); cw.setBackorder(0);
+        }
+        for (NodeState r : retailers) {
+            r.setOnHand(r.getBaseStock()); r.getInTransit().clear(); r.setBackorder(0);
+        }
+    }
+
+    private void summarizeResults(List<Metrics> resC, List<Metrics> resD) {
+        SummaryMetrics sC = calculateAverages(resC);
+        SummaryMetrics sD = calculateAverages(resD);
+        String row = "%-20s | %-15.2f | %-15.2f%n";
+        System.out.printf("%-20s | %-15s | %-15s%n", "METRIC", "CENTRAL", "DECENTRAL");
+        System.out.printf(row, "Total Cost/Day", sC.totalCostPerDay, sD.totalCostPerDay);
+        System.out.printf(row, "Fill Rate", sC.fillRate, sD.fillRate);
+        System.out.printf(row, "Hold Cost/Day", sC.avgHoldingCostPerDay, sD.avgHoldingCostPerDay);
+    }
+
+    private SummaryMetrics calculateAverages(List<Metrics> res) {
+        SummaryMetrics s = new SummaryMetrics();
+        double h = res.stream().mapToDouble(Metrics::getHoldingCost).sum();
+        double b = res.stream().mapToDouble(Metrics::getBackorderCost).sum();
+        double t = res.stream().mapToDouble(Metrics::getTransportCost).sum();
+        int f = res.stream().mapToInt(Metrics::getFillImmediate).sum();
+        int d = res.stream().mapToInt(Metrics::getDemandTotal).sum();
+        s.totalCostPerDay = (h + b + t) / (Params.T_DAYS * res.size());
+        s.fillRate = (double) f / d;
+        s.avgHoldingCostPerDay = h / (Params.T_DAYS * res.size());
+        return s;
+    }
+
     public static void main(String[] args) {
         new Simulation().runExperiment();
-    }
-
-    private SummaryMetrics calculateAverages(List<Metrics> results) {
-        if (results == null || results.isEmpty()) {
-            return new SummaryMetrics(); 
-        }
-
-        int R = results.size();
-        int T_DAYS = Params.T_DAYS;
-
-        // Sum up the raw metric totals from all replications
-        double total_holding = results.stream().mapToDouble(Metrics::getHoldingCost).sum();
-        double total_backorder = results.stream().mapToDouble(Metrics::getBackorderCost).sum();
-        double total_transport = results.stream().mapToDouble(Metrics::getTransportCost).sum();
-        int total_orders = results.stream().mapToInt(Metrics::getOrdersCount).sum();
-        int total_fill_immediate = results.stream().mapToInt(Metrics::getFillImmediate).sum();
-        int total_demand = results.stream().mapToInt(Metrics::getDemandTotal).sum();
-        
-        SummaryMetrics summary = new SummaryMetrics();
-
-        // Total Cost / day = sum(Holding + Backorder + Transport) / (T_days * R)
-        summary.totalCostPerDay = (total_holding + total_backorder + total_transport) / (T_DAYS * R);
-        
-        // Fill Rate = sum(fill_immediate) / sum(demand_total)
-        summary.fillRate = (double) total_fill_immediate / total_demand;
-
-        // Avg Cost / day
-        summary.avgHoldingCostPerDay = total_holding / (T_DAYS * R);
-        summary.avgBackorderCostPerDay = total_backorder / (T_DAYS * R);
-        summary.avgTransportCostPerDay = total_transport / (T_DAYS * R);
-
-        // Orders per day
-        summary.avgOrdersPerDay = (double) total_orders / (T_DAYS * R);
-
-        return summary;
-    }
-
-
-    /**
-     * Generates and prints the final side-by-side comparison table (Phase 5 Deliverable).
-     */
-    private void summarizeResults(List<Metrics> resultsCentralized, List<Metrics> resultsDecentralized) {
-        
-        SummaryMetrics sumC = calculateAverages(resultsCentralized);
-        SummaryMetrics sumD = calculateAverages(resultsDecentralized);
-
-        // Define the format for printing the table
-        String formatHeader = "%-20s | %-15s | %-15s%n";
-        String formatRow = "%-20s | %-15.2f | %-15.2f%n";
-        String formatRowPct = "%-20s | %-15.3f | %-15.3f%n";
-
-        System.out.println("\n" + "-".repeat(55));
-        System.out.printf(formatHeader, "METRIC", "CENTRALIZED", "DECENTRALIZED");
-        System.out.println("-".repeat(55));
-
-        // Total Cost (Primary KPI)
-        System.out.printf(formatRow, "**Total Cost / Day**", sumC.totalCostPerDay, sumD.totalCostPerDay);
-        System.out.println("-".repeat(55));
-
-        // Service Level
-        System.out.printf(formatRowPct, "Fill Rate (beta)", sumC.fillRate, sumD.fillRate);
-
-        // Component Costs
-        System.out.printf(formatRow, "Holding Cost / Day", sumC.avgHoldingCostPerDay, sumD.avgHoldingCostPerDay);
-        System.out.printf(formatRow, "Backorder Cost / Day", sumC.avgBackorderCostPerDay, sumD.avgBackorderCostPerDay);
-        System.out.printf(formatRow, "Transport Cost / Day", sumC.avgTransportCostPerDay, sumD.avgTransportCostPerDay);
-        
-        // Frequency Metric
-        System.out.printf(formatRow, "Orders Per Day", sumC.avgOrdersPerDay, sumD.avgOrdersPerDay);
-
-        System.out.println("-".repeat(55));
     }
 }
