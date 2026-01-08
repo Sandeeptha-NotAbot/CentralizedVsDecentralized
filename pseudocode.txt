@@ -1,0 +1,255 @@
+STRUCTURES: 
+
+STRUCT Shipment:
+    qty: int                      # How many units are in this shipment.
+    src: NodeID                   # Origin location (e.g., "MFG" or "CW").
+    dst: NodeID                   # Destination location (e.g., "Retailer_1").
+    arrive_day: int               # The specific simulation day the shipment will arrive (current_day + lead_time).
+    transport_cost_per_unit: float# Cost to move one unit for this specific leg.
+
+STRUCT NodeState:
+    name: string                  # Identifier: "Retailer_i", "CW", or "MFG".
+    on_hand: int                  # Physical inventory currently at the location.
+    backorder: int                # Units of demand that could not be filled and are waiting (future liability).
+    in_transit: list<Shipment>    # Inventory that has been ordered and is currently on the way.
+    base_stock: int               # S_node: The target Inventory Position (the control parameter for this node).
+    orders_placed_today: int      # Audit/debug: Tracks outbound orders for the current day.
+
+STRUCT Metrics:
+    holding_cost: float           # Accumulated cost for holding inventory (on_hand).
+    backorder_cost: float         # Accumulated cost for having backorders (unmet demand).
+    transport_cost: float         # Accumulated cost for all shipments across the entire supply chain.
+    orders_count: int             # Total number of *ordering events* (used to compare ordering frequency).
+    fill_immediate: int           # Total units served directly from on-hand stock (numerator for Fill Rate).
+    demand_total: int             # Total customer demand realized (denominator for Fill Rate).
+    backorders_created: int       # Total units of demand that became a backorder on the day of demand.
+
+RETAILERS: array<NodeState> of length N # The collection of retailers facing customer demand.
+CW: NodeState (exists only in centralized design) # Central Warehouse, the optional buffer node.
+MFG: NodeState (infinite capacity; on_hand unused) # Manufacturer, assumed to be an unconstrained source.
+
+PARAMS: all costs, lead times, demand means/sigmas, correlation, horizon T_days, replications R
+METRICS: Metrics (reset each replication)
+RNG: seeded random generator # Used to ensure that different scenarios (e.g., centralized vs. decentralized) can be compared using the *same* stream of random demand.
+
+
+
+
+UTIL FUNCTIONS: 
+
+FUNCTION draw_daily_demand(i: int) -> int
+    # Option A: independent Normal truncated at 0
+    # Option B: correlated multivariate draw (ρ)
+    # The demand model must handle correlation (ρ) to test the effect of risk pooling.
+    return max(0, round(Normal(mu_i, sigma_i))) # Demand is always non-negative and an integer.
+
+FUNCTION receive_shipments(node: NodeState, day: int):
+    # This function executes the "Arrivals" step of the daily cycle.
+    for sh in node.in_transit where sh.arrive_day == day:
+        node.on_hand += sh.qty # Move arrived quantity from 'in_transit' to 'on_hand' inventory.
+    remove all delivered from node.in_transit # Clear the list to stop tracking delivered shipments.
+
+FUNCTION ship(dst: NodeState, qty: int, src_name: string, lead: int, c_per_unit: float, today: int):
+    # This function processes an order and creates a shipment that will arrive later.
+    if qty <= 0: return # Only ship positive quantities.
+    sh = Shipment(qty=qty, src=src_name, dst=dst.name,
+                  arrive_day=today + lead, # Calculate the arrival day based on current day and lead time.
+                  transport_cost_per_unit=c_per_unit)
+    # Attach shipment to 'dst' (we track arrivals at receiver)
+    dst.in_transit.append(sh) # The receiving node is responsible for tracking its incoming shipments.
+    METRICS.transport_cost += qty * c_per_unit # Immediately record the transportation cost.
+
+FUNCTION fulfill_demand(node: NodeState, demand: int):
+    # This function handles customer interaction: demand realization and service.
+    served = min(node.on_hand, demand) # Serve up to the amount available or the demand.
+    node.on_hand -= served
+    METRICS.fill_immediate += served # Track units served immediately (important for Fill Rate).
+    if served < demand:
+        shortage = demand - served
+        node.backorder += shortage # Add unserved demand to the backorder queue.
+        METRICS.backorders_created += shortage # Track total units that became a backorder.
+    METRICS.demand_total += demand # Record all demand for service metric calculations.
+
+FUNCTION clear_backorders_with_receipt(node: NodeState):
+    # Call right after receive_shipments. Uses new inventory to fill old customer orders first.
+    if node.backorder > 0 and node.on_hand > 0:
+        cleared = min(node.on_hand, node.backorder)
+        node.on_hand -= cleared # Use available stock to clear the backlog.
+        node.backorder -= cleared # Reduce the backorder liability.
+    # (We treat backorders FIFO implicitly at the node level) - Simplification: all backorders are treated as one queue.
+
+FUNCTION inventory_position(node: NodeState) -> int:
+    # This is the key metric for the Base-Stock policy.
+    in_transit_qty = sum(sh.qty for sh in node.in_transit) # Sum of all pending orders.
+    # IP = Stock on Hand + Stock on Order - Backorder Liability
+    return node.on_hand + in_transit_qty - node.backorder
+
+FUNCTION place_base_stock_order(node: NodeState, supplier: NodeState,
+                                lead: int, c_per_unit: float, today: int):
+    # Implements the (S-1, S) or Base-Stock policy.
+    ip = inventory_position(node)
+    qty = node.base_stock - ip # Order quantity needed to bring IP back up to the target S.
+    if qty > 0:
+        ship(dst=node, qty=qty, src_name=supplier.name,
+             lead=lead, c_per_unit=c_per_unit, today=today) # Place the order (which creates an 'in_transit' shipment).
+        METRICS.orders_count += 1 # Track how many times an order event occurs.
+        node.orders_placed_today += qty # Track the *quantity* ordered for auditing.
+
+FUNCTION accrue_daily_holding_and_backorder_costs(all_nodes: list<NodeState>):
+    # This is the "cost accounting" step at the end of the day.
+    for n in all_nodes:
+        # Holding cost is applied to *ending* inventory.
+        METRICS.holding_cost += n.on_hand * COST.holding_per_unit_day
+        # Backorder cost is applied to the liability carried into the next day.
+        METRICS.backorder_cost += n.backorder * COST.backorder_per_unit_day
+
+
+
+
+BASE STOCK:
+FUNCTION compute_base_stocks():
+    # Calculates the target S for each node based on Normal distribution approximation (safety stock formula).
+
+    # Retailers (identical parameters):
+    for each retailer i:
+        mu = DEMAND.mean[i]           # Average demand per day.
+        sigma = DEMAND.sigma[i]       # Demand standard deviation per day.
+        L = LT(CW→Retailer) OR LT(MFG→Retailer) # L is the Lead Time (L) relevant to the node's supplier.
+        z = z_from_fill_rate(target=0.95) # z-score chosen to achieve the target service level (e.g., 95%).
+        # S_i is calculated using: Expected Demand Over Lead Time + Safety Stock
+        S_i = mu*L + z*sigma*sqrt(L) # The safety stock term (z*sigma*sqrt(L)) is crucial.
+        RETAILERS[i].base_stock = round(S_i)
+
+    if CENTRALIZED:
+        # Central Warehouse aggregates variability: This is the core logic of Risk Pooling.
+        # The sum of demands has less variability than the sum of individual variabilities.
+        # sigma_agg = sigma * sqrt(n + ρ n(n-1)) for identical retailers
+        sigma_agg = sigma * sqrt(N + rho*N*(N-1)) # Aggregated standard deviation calculation.
+        Lcw = LT(MFG→CW) # CW's relevant lead time (from MFG).
+        mu_agg = N * mu # Aggregated mean demand (sum of all retailers).
+        SCW = mu_agg*Lcw + z*sigma_agg*sqrt(Lcw) # CW's Base Stock calculation using the lower aggregated variability.
+        CW.base_stock = round(SCW)
+
+
+
+
+
+CENTRALIZED & DECENTRALIZED:
+FUNCTION run_centralized_replication(seed):
+    # Simulates the system (MFG -> CW -> Retailers).
+    init RNG(seed)
+    init states for CW and N retailers:
+        set on_hand to base_stock (or warm-up), backorder=0, in_transit=[] # Start in a stable state.
+    METRICS ← zeros
+    for day in 1..T_days:
+
+        # 1) Arrivals then clear backorders
+        receive_shipments(CW, day)
+        clear_backorders_with_receipt(CW)
+        for each retailer r:
+            receive_shipments(r, day)
+            clear_backorders_with_receipt(r)
+
+        # 2) Retailer demand realization and service (customer-facing)
+        for each retailer r:
+            d = draw_daily_demand(r.index)
+            fulfill_demand(r, d)
+
+        # 3) CW allocates to retailers (if you model same-day releases)
+        #    Option A: Allocation only when retailer orders (below).
+        #    Here we keep allocation when orders placed, see step 5.
+        # Note: In this model, CW's inventory release is triggered by the retailer's order in Step 5.
+
+        # 4) End-of-day base-stock review at CW (order to MFG if needed)
+        place_base_stock_order(node=CW, supplier=MFG,
+                               lead=LT(MFG→CW),
+                               c_per_unit=COST.transport_inbound,
+                               today=day) # CW orders to top up its own Inventory Position.
+
+        # 5) End-of-day retailer reviews & orders to CW
+        for each retailer r:
+            # CW will ship; arrival occurs after LT(CW→Retailer)
+            place_base_stock_order(node=r, supplier=CW,
+                                   lead=LT(CW→Retailer),
+                                   c_per_unit=COST.transport_outbound,
+                                   today=day) # Retailers order from the CW. The CW is assumed to immediately ship from stock.
+
+        # 6) Costs for the day
+        accrue_daily_holding_and_backorder_costs([CW] + RETAILERS) # Costs apply to all nodes in the system.
+
+    return METRICS
+
+FUNCTION run_decentralized_replication(seed):
+    # Simulates the single system (MFG -> Retailers).
+    init RNG(seed)
+    init states for N retailers:
+        on_hand = base_stock; backorder=0; in_transit=[]
+    METRICS ← zeros
+    for day in 1..T_days:
+
+        # 1) Arrivals then clear backorders
+        for each retailer r:
+            receive_shipments(r, day)
+            clear_backorders_with_receipt(r)
+
+        # 2) Retailer demand realization
+        for each retailer r:
+            d = draw_daily_demand(r.index)
+            fulfill_demand(r, d)
+
+        # 3) End-of-day retailer reviews & orders directly to MFG
+        for each retailer r:
+            place_base_stock_order(node=r, supplier=MFG,
+                                   lead=LT(MFG→Retailer), # Note the longer direct lead time (usually L_decentralized > L_centralized path).
+                                   c_per_unit=COST.transport_direct,
+                                   today=day) # Retailers order directly from the MFG.
+
+        # 4) Costs for the day
+        accrue_daily_holding_and_backorder_costs(RETAILERS) # Costs only apply to the retailer nodes.
+
+    return METRICS
+
+FUNCTION run_experiment():
+    # The overarching function that runs both scenarios and compares results.
+    results_centralized = []
+    results_decentralized = []
+
+    for rep in 1..R:
+        compute_base_stocks()  # Calculate S values for the centralized design (uses L_CW and L_CW->R).
+        resC = run_centralized_replication(seed=BASE_SEED+rep)
+        results_centralized.append(resC)
+
+        compute_base_stocks()  # Recompute S values for the decentralized design (uses L_MFG->R).
+        resD = run_decentralized_replication(seed=BASE_SEED+1000+rep) # Use a different seed block for the second scenario.
+        results_decentralized.append(resD)
+
+    SUMMARY_C = summarize(results_centralized)
+    SUMMARY_D = summarize(results_decentralized) # Average the metrics over all R replications.
+
+    print side-by-side table:
+        Fill Rate = sum(fill_immediate) / sum(demand_total) # The service level metric.
+        Avg Holding Cost / day
+        Avg Backorder Cost / day
+        Transport Cost / day
+        Total Cost / day = sum(Holding + Backorder + Transport) / (T_days * R)
+        Orders per day
+
+EOQ = sqrt( 2 * K * D_annual / h_annual ) # Economic Order Quantity formula (included as a potential alternative/extension).
+
+# Where:
+# K = order/setup cost per order
+# D_annual = annual demand
+# h_annual = holding cost per unit per year
+# Use EOQ as a fixed batch size; switch the retailer/CW order rule to:
+IF IP < ReorderPoint THEN order Q = EOQ # This is the logic for a Q,R policy (Order up to S is an (S-1, S) policy).
+ReorderPoint ≈ μ*L + z*σ*sqrt(L) - (on_order - backorders) # Reorder Point (R) calculation.
+# This section indicates a possible future extension to a (Q, R) policy where Q=EOQ and R=ReorderPoint.
+
+# Example Data Outputs:
+design,rep,day,holding_cost,backorder_cost,transport_cost,orders_count,fill_immediate,demand_total,on_hand_total,backorder_total
+centralized,1,1, ..., ..., ... # Detailed daily data for analysis.
+...
+
+design,avg_total_cost,avg_fill_rate,avg_holding,avg_backorder,avg_transport,orders_per_day
+centralized, ...
+decentralized, ... # Final summary comparison of the two supply chain designs.
