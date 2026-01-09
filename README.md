@@ -9,7 +9,7 @@ This project is a discrete-event simulation built in Java to analyze the strateg
 
 
 
-### 🔍 Key Findings
+### Key Findings
 * **Risk Pooling Proof:** When correlation ($\rho$) was increased to 1.0 (Test 2), centralized holding costs rose. This validates that consolidation benefits depend on independent regional markets.
 * **The Tipping Point (Test 5):** This is the "break-even" scenario where the Decentralized model wins. It proves that for high-value items, a **Lean Decentralized** model is superior because capital costs of safety stock outweigh shipping savings.
 * **Service Level Stability:** Under extreme volatility (Test 4), the Centralized system maintained a higher **Fill Rate**, proving a central hub acts as a superior buffer for customer service.
